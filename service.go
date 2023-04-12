@@ -353,6 +353,39 @@ func RecordSigningService(keyring *Keyring) {
 	}
 }
 
+func InitializeRecords() error {
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	db := client.Database("record-signing-service")
+	coll := db.Collection("records")
+
+	// Delete existing records
+	_, err = coll.DeleteMany(context.Background(), bson.M{})
+	if err != nil {
+		return fmt.Errorf("failed to delete existing records: %v", err)
+	}
+
+	// Insert 100,000 records of random data
+	records := make([]interface{}, 100000)
+	for i := 0; i < 100000; i++ {
+		data := make([]byte, 100)
+		rand.Read(data)
+		record := Record{ID: int64(i), Data: base64.StdEncoding.EncodeToString(data)}
+		records[i] = record
+	}
+
+	_, err = coll.InsertMany(context.Background(), records)
+	if err != nil {
+		return fmt.Errorf("failed to insert records: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
 	// Initialize the keyring with 100 private keys
 	keys := make([][]byte, 100)

@@ -1,215 +1,377 @@
+package main
+
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/streadway/amqp"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type Record struct {
-	ID        int    `bson:"_id,omitempty"`
+	ID        int64  `bson:"_id,omitempty"`
 	Data      string `bson:"data"`
 	Signature string `bson:"signature"`
 }
 
-type KeyUsage struct {
-	Key      string
-	LastUsed time.Time
-}
-
 type Keyring struct {
-	Keys  []string
-	Usage map[string]time.Time
-	Mutex sync.Mutex
+	keys        [][]byte
+	keyUsageMap map[int]int64
+	mux         sync.Mutex
 }
 
-func (k *Keyring) GetLeastRecentlyUsed() string {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
+func NewKeyring(keys [][]byte) *Keyring {
+	keyring := &Keyring{
+		keys:        keys,
+		keyUsageMap: make(map[int]int64),
+	}
+	return keyring
+}
 
-	var leastRecentlyUsedKey string
-	var leastRecentlyUsedTime time.Time
-	for _, key := range k.Keys {
-		lastUsedTime, ok := k.Usage[key]
-		if !ok || lastUsedTime.Before(leastRecentlyUsedTime) {
-			leastRecentlyUsedKey = key
-			leastRecentlyUsedTime = lastUsedTime
+func (kr *Keyring) GetLeastRecentlyUsedKey() ([]byte, error) {
+	kr.mux.Lock()
+	defer kr.mux.Unlock()
+
+	if len(kr.keys) == 0 {
+		return nil, errors.New("no keys available")
+	}
+
+	minTime := int64(0)
+	minIndex := 0
+	for i, key := range kr.keys {
+		if usageTime, ok := kr.keyUsageMap[i]; !ok || usageTime < minTime {
+			minTime = usageTime
+			minIndex = i
 		}
 	}
 
-	k.Usage[leastRecentlyUsedKey] = time.Now()
-	return leastRecentlyUsedKey
+	if minTime == 0 {
+		kr.keyUsageMap[minIndex] = time.Now().Unix()
+	} else {
+		kr.keyUsageMap[minIndex] = time.Now().Unix()
+	}
+
+	return kr.keys[minIndex], nil
 }
 
-func SignRecords(records []Record, key string) {
+func SignRecords(records []Record, privateKey []byte) error {
+	key, err := x509.ParsePKCS1PrivateKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to parse private key: %v", err)
+	}
+
 	for i := range records {
-		signature := Sign(records[i].Data, key)
-		records[i].Signature = signature
-	}
-
-	SaveRecords(records)
-}
-
-func Sign(data string, key string) string {
-	// Decode the private key from base64
-	keyBytes, err := base64.StdEncoding.DecodeString(key)
-	if err != nil {
-		panic(err)
-	}
-
-	// Parse the RSA private key
-	privateKey, err := rsa.ParsePKCS1PrivateKey(keyBytes)
-	if err != nil {
-		panic(err)
-	}
-
-	// Calculate the SHA-256 hash of the data
-	hash := sha256.Sum256([]byte(data))
-
-	// Sign the hash using the private key
-	signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, hash[:])
-	if err != nil {
-		panic(err)
-	}
-
-	// Encode the signature as base64 and return it
-	return base64.StdEncoding.EncodeToString(signature)
-}
-
-func SaveRecords(records []Record) {
-	// Convert the records to MongoDB documents
-	var docs []interface{}
-	for _, r := range records {
-		docs = append(docs, r)
-	}
-
-	// Insert the documents into the MongoDB collection
-	_, err := mongoCollection.InsertMany(context.Background(), docs)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func GetUnsignedRecords(batchSize int) []Record {
-	// Find up to batchSize unsigned records from the MongoDB collection
-	var unsignedRecords []Record
-	filter := bson.M{"signature": ""}
-	options := options.Find().SetLimit(int64(batchSize))
-	cursor, err := mongoCollection.Find(context.Background(), filter, options)
-	if err != nil {
-		panic(err)
-	}
-	defer cursor.Close(context.Background())
-	for cursor.Next(context.Background()) {
-		var r Record
-		err := cursor.Decode(&r)
+		hash := sha256.Sum256([]byte(records[i].Data))
+		signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("failed to sign record %d: %v", records[i].ID, err)
 		}
-		unsignedRecords = append(unsignedRecords, r)
+		records[i].Signature = base64.StdEncoding.EncodeToString(signature)
 	}
-	if err := cursor.Err(); err != nil {
-		panic(err)
-	}
-	return unsignedRecords
+
+	return nil
 }
-func KeyManagementService(broker string, keyring *Keyring) {
-	// Connect to the RabbitMQ broker
-	conn, err := amqp.Dial(broker)
+
+func Sign(data string, privateKey []byte) (string, error) {
+	key, err := x509.ParsePKCS1PrivateKey(privateKey)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	hash := sha256.Sum256([]byte(data))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
+	if err != nil {
+		return "", fmt.Errorf("failed to sign data: %v", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(signature), nil
+}
+
+func SaveRecords(ctx context.Context, records []Record, coll *mongo.Collection) error {
+	documents := make([]interface{}, len(records))
+	for i, record := range records {
+		documents[i] = record
+	}
+	_, err := coll.InsertMany(ctx, documents)
+	if err != nil {
+		return fmt.Errorf("failed to save records to database: %v", err)
+	}
+	return nil
+}
+
+func GetUnsignedRecords(ctx context.Context, batchSize int, coll *mongo.Collection) ([]Record, error) {
+	opts := options.Find().SetLimit(int64(batchSize))
+	filter := bson.M{"signature": ""}
+	cursor, err := coll.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve unsigned records: %v", err)
+	}
+	defer cursor.Close(ctx)
+
+	var records []Record
+	for cursor.Next(ctx) {
+		var record Record
+		if err := cursor.Decode(&record); err != nil {
+			return nil, fmt.Errorf("failed to decode record: %v", err)
+		}
+		records = append(records, record)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("error while retrieving unsigned records: %v", err)
+	}
+
+	return records, nil
+}
+func KeyManagementService(keyring *Keyring) {
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 	defer conn.Close()
 
-	// Open a channel on the connection
 	ch, err := conn.Channel()
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to open a channel: %v", err)
 	}
 	defer ch.Close()
 
-	// Declare a queue for key requests
-	q, err := ch.QueueDeclare(
-		"key_requests",
-		false, // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
+	queue, err := ch.QueueDeclare(
+		"key-requests", // name
+		false,          // durable
+		false,          // delete when unused
+		false,          // exclusive
+		false,          // no-wait
+		nil,            // arguments
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to declare a queue: %v", err)
 	}
 
-	// Declare a queue for key responses
-	r, err := ch.QueueDeclare(
-		"key_responses",
-		false, // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	// Consume messages from the key request queue
 	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
+		queue.Name, // queue
+		"",         // consumer
+		true,       // auto-ack
+		false,      // exclusive
+		false,      // no-local
+		false,      // no-wait
+		nil,        // args
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to register a consumer: %v", err)
 	}
 
 	for msg := range msgs {
-		// Get the batch size from the message body
-		batchSize, err := strconv.Atoi(string(msg.Body))
+		var batchSize int
+		err := json.Unmarshal(msg.Body, &batchSize)
 		if err != nil {
-			panic(err)
+			log.Printf("Failed to decode message body: %v", err)
+			continue
 		}
 
-		// Get the least recently used key from the keyring
-		key := keyring.GetLeastRecentlyUsed()
+		key, err := keyring.GetLeastRecentlyUsedKey()
+		if err != nil {
+			log.Printf("Failed to get key from keyring: %v", err)
+			continue
+		}
 
-		// Send the key back in a response message
+		response, err := json.Marshal(key)
+		if err != nil {
+			log.Printf("Failed to encode response message: %v", err)
+			continue
+		}
+
 		err = ch.Publish(
-			"",     // exchange
-			r.Name, // routing key
-			false,  // mandatory
-			false,  // immediate
+			"",          // exchange
+			msg.ReplyTo, // routing key
+			false,       // mandatory
+			false,       // immediate
 			amqp.Publishing{
-				ContentType: "text/plain",
-				Body:        []byte(key),
-			},
+				ContentType:   "text/plain",
+				CorrelationId: msg.CorrelationId,
+				Body:          response,
+			})
+		if err != nil {
+			log.Printf("Failed to send response message: %v", err)
+		}
+	}
+}
+
+func RecordSigningService(keyring *Keyring) {
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %v", err)
+	}
+	defer ch.Close()
+
+	reqQueue, err := ch.QueueDeclare(
+		"key-requests", // name
+		false,          // durable
+		false,          // delete when unused
+		false,          // exclusive
+		false,          // no-wait
+		nil,            // arguments
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare a queue: %v", err)
+	}
+
+	resQueue, err := ch.QueueDeclare(
+		"key-responses", // name
+		false,           // durable
+		false,           // delete when unused
+		false,           // exclusive
+		false,           // no-wait
+		nil,             // arguments
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare a queue: %v", err)
+	}
+
+	for {
+		records, err := GetUnsignedRecords(context.Background(), 10, coll)
+		if err != nil {
+			log.Printf("Failed to retrieve unsigned records: %v", err)
+			continue
+		}
+
+		if len(records) == 0 {
+			log.Printf("All records signed")
+			break
+		}
+
+		key, err := keyring.GetLeastRecentlyUsedKey()
+		if err != nil {
+			log.Printf("Failed to get key from keyring: %v", err)
+			continue
+			// TODO: Add logic to handle the case where all keys are in use
+		}
+
+		// Send key request message to key management service
+		batchSize := len(records)
+		body, err := json.Marshal(batchSize)
+		if err != nil {
+			log.Printf("Failed to encode message body: %v", err)
+			continue
+		}
+
+		msg := amqp.Publishing{
+			ContentType:   "text/plain",
+			CorrelationId: uuid.New().String(),
+			ReplyTo:       resQueue.Name,
+			Body:          body,
+		}
+
+		err = ch.Publish(
+			"",            // exchange
+			reqQueue.Name, // routing key
+			false,         // mandatory
+			false,         // immediate
+			msg,
 		)
 		if err != nil {
-			panic(err)
+			log.Printf("Failed to send key request message: %v", err)
+			continue
+			// TODO: Add logic to handle the case where the message could not be sent
 		}
 
-		// Wait for a short time to simulate key signing
-		time.Sleep(time.Millisecond * 500)
+		// Wait for key response message
+		deliveries, err := ch.Consume(
+			resQueue.Name, // queue
+			"",            // consumer
+			true,          // auto-ack
+			false,         // exclusive
+			false,         // no-local
+			false,         // no-wait
+			nil,           // args
+		)
+		if err != nil {
+			log.Printf("Failed to register a consumer: %v", err)
+			continue
+			// TODO: Add logic to handle the case where the consumer could not be registered
+		}
 
-		// Sign the next batch of records with the key
-		unsignedRecords := GetUnsignedRecords(batchSize)
-		SignRecords(unsignedRecords, key)
+		var selectedKey []byte
+		for delivery := range deliveries {
+			if delivery.CorrelationId == msg.CorrelationId {
+				err = json.Unmarshal(delivery.Body, &selectedKey)
+				if err != nil {
+					log.Printf("Failed to decode key response message body: %v", err)
+					continue
+				}
+				break
+			}
+		}
 
-		// Log the signing
-		log.Printf("Signed batch of %d records with key %s", len(unsignedRecords), key)
+		// Check if a key was received
+		if selectedKey == nil {
+			log.Printf("No key received")
+			continue
+			// TODO: Add logic to handle the case where no key was received
+		}
+
+		err = SignRecords(records, selectedKey)
+		if err != nil {
+			log.Printf("Failed to sign records: %v", err)
+			continue
+			// TODO: Add logic to handle the case where the records could not be signed
+		}
+
+		err = SaveRecords(context.Background(), records, coll)
+		if err != nil {
+			log.Printf("Failed to save signed records: %v", err)
+			continue
+			// TODO: Add logic to handle the case where the signed records could not be saved
+		}
+
+		// Mark key as used in keyring
+		err = keyring.MarkKeyAsUsed(selectedKey)
+		if err != nil {
+			log.Printf("Failed to mark key as used: %v", err)
+			continue
+			// TODO: Add logic to handle the case where the key could not be marked as used
+		}
 	}
+}
+
+func main() {
+	// Initialize the keyring with 100 private keys
+	keys := make([][]byte, 100)
+	for i := 0; i < 100; i++ {
+		key, _ := rsa.GenerateKey(rand.Reader, 2048)
+		keys[i] = x509.MarshalPKCS1PrivateKey(key)
+	}
+	keyring := NewKeyring(keys)
+
+	// Initialize the MongoDB collection with 100,000 records of random data
+	err := InitializeRecords()
+	if err != nil {
+		log.Fatalf("Failed to initialize records: %v", err)
+	}
+
+	// Start the key management service and record signing service
+	go KeyManagementService(keyring)
+	go RecordSigningService(keyring)
+
+	// Wait for the services to finish
+	select {}
 }
